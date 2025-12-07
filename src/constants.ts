@@ -27,6 +27,7 @@ export const defaultEntryConfig = {
   },
   pull_request: {
     disabled: false,
+    force: true,
     title: 'Sync files with `<%- repository %>`',
     body: `
 This PR contains the following updates:
@@ -37,18 +38,34 @@ This PR contains the following updates:
 
 ---
 
-### Changed Files
+### Modified Files
 
 <%_ for (const file of changes) { -%>
 - <% if (file.from === file.to) { %>\`<%- file.to %>\`<% } else { %>\`<%- file.from %>\` to \`<%- file.to %>\`<% }%>
+<%_ } -%>
+
+### Deleted Files
+
+<%_ for (const file of deleted) { -%>
+- \`<%- file.path %>\`
 <%_ } -%>
     `.trim(),
     reviewers: [] as string[],
     assignees: [] as string[],
     labels: [] as string[],
+    merge: {
+      mode: 'disabled',
+      strategy: 'merge',
+      delete_branch: false,
+      commit: {}, // default -> Git provided default merge commit message
+    },
   },
 };
 
 export const defaultFile = {
   exclude: [] as string[],
+};
+
+export const defaultDeleteFile = {
+  type: 'file' as string,
 };

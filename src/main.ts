@@ -18,59 +18,29 @@ import {
   PR_FOOTER,
   defaultEntryConfig,
   defaultFile,
+  defaultDeleteFile,
 } from './constants.js';
-import { createGitHub } from './github.js';
+import { createGitHub, MergeResult } from './github.js';
 import { getInputs } from './inputs.js';
-import { convertValidBranchName, merge } from './utils.js';
+import { convertValidBranchName, merge, splitCommitMessage } from './utils.js';
 
 const json = (input: unknown) => JSON.stringify(input, null, '  ');
 const info = (key: string, value: string) => core.info(`${key.padStart(21)}: ${value}`);
 
-const getValidInputs = T.tryCatchK(
-  () => {
-    const inputs = getInputs();
-
-    if (inputs.github_token === null) {
-      if (
-        inputs.github_app_id === null ||
-        inputs.github_app_installation_id === null ||
-        inputs.github_app_private_key === null
-      ) {
-        throw new Error('"GITHUB_TOKEN" or "GITHUB_APP_*" is required, but not specified in "inputs" field.');
-      }
-    } else {
-      if (
-        inputs.github_app_id !== null ||
-        inputs.github_app_installation_id !== null ||
-        inputs.github_app_private_key !== null
-      ) {
-        throw new Error('If "GITHUB_TOKEN" is specified, "GITHUB_APP_*" cannot be specified.');
-      }
-    }
-
-    return inputs;
-  },
-  (error) => new Error(String(error)),
-);
-
 const run = async (): Promise<number> => {
   const cwd = process.cwd();
 
-  const inputs = getValidInputs();
-  if (T.isLeft(inputs)) {
-    core.setFailed(inputs.left.message);
-    return 1;
-  }
+  const inputs = getInputs();
 
-  const config = await loadConfig(inputs.right.config_file)();
+  const config = await loadConfig(inputs.config_file)();
   if (T.isLeft(config)) {
-    core.setFailed(`Load config error: ${inputs.right.config_file}#${config.left.message}`);
+    core.setFailed(`Load config error: ${inputs.config_file}#${config.left.message}`);
     return 1;
   }
   core.debug(`config: ${json(config.right)}`);
 
   const settings = config.right.settings;
-  const github = createGitHub(inputs.right);
+  const github = createGitHub(inputs);
   const prUrls = new Set<string>();
   const syncedFiles = new Set<string>();
 
@@ -137,17 +107,21 @@ const run = async (): Promise<number> => {
 
             return await Promise.all(
               paths.map(async ([from, to]) => {
-                const raw = await fs.readFile(path.join(cwd, from), 'utf8');
+                const fpath = path.join(cwd, from);
+                const raw = await fs.readFile(fpath, 'utf8');
+                const stat = await fs.stat(fpath);
+                const mode = (stat.mode & fs.constants.S_IXUSR) !== 0 ? '100755' : '100644';
                 const content = entry.template !== undefined ? render(raw, entry.template) : raw;
                 return {
                   from,
                   to,
+                  mode,
                   content,
-                };
+                } as const;
               }),
             );
           },
-          (reason) => new Error(`${id} - File resolve error: ${reason}`),
+          (reason) => new Error(`${id} - File resolve error: ${String(reason)}`),
         );
       }),
       A.sequence(TE.ApplicativePar),
@@ -167,10 +141,31 @@ const run = async (): Promise<number> => {
     // Commit to repository
     core.info(`Synchronize ${files.right.length} files:`);
 
+    const deleteFiles =
+      entry.delete_files !== undefined
+        ? entry.delete_files.map((f) => {
+            const deleteFile =
+              typeof f === 'string'
+                ? {
+                    ...defaultDeleteFile,
+                    path: f,
+                    type: 'file',
+                  }
+                : {
+                    ...f,
+                  };
+            return deleteFile;
+          })
+        : [];
+
+    for (const deleteFile of deleteFiles) {
+      core.debug(`  - delete "${deleteFile.path}" of type "${deleteFile.type}"`);
+    }
+
     for (const name of entry.repositories) {
       core.info('	');
 
-      const id = `patterns.${i}#${name}`;
+      const id = `patterns.${i} ${name}`;
 
       const repository = await github.initializeRepository(name)();
       if (T.isLeft(repository)) {
@@ -200,7 +195,11 @@ const run = async (): Promise<number> => {
       // Get parent SHA
       let parent: string;
       if (existingPr.right !== null) {
-        parent = existingPr.right.base.sha;
+        if (cfg.pull_request.force) {
+          parent = existingPr.right.base.sha;
+        } else {
+          parent = existingPr.right.head.sha;
+        }
         info('Existing Pull Request', existingPr.right.html_url);
       } else {
         const b = await repo.createBranch(branch)();
@@ -227,18 +226,32 @@ const run = async (): Promise<number> => {
         }),
         files: files.right.map((file) => ({
           path: file.to,
+          mode: file.mode,
           content: file.content,
         })),
+        deleteFiles: deleteFiles.map((deleteFile) => ({
+          path: deleteFile.path,
+          mode: deleteFile.type === 'directory' ? '040000' : '100644',
+          type: deleteFile.type === 'directory' ? 'tree' : 'blob',
+          sha: null,
+        })),
+        force: cfg.pull_request.force,
       })();
       if (T.isLeft(commit)) {
+        core.info(
+          'If pushing to .github/workflows, make sure the github token has the "workflow" scope. See: https://github.com/wadackel/files-sync-action?tab=readme-ov-file#authentication',
+        );
         core.setFailed(`${id} - ${commit.left.message}`);
         return 1;
       }
       core.debug(`commit: ${json(commit.right)}`);
-      info('Commit', commit.right.sha);
-      info('Commit SHA', commit.right.message);
+      info('Commit SHA', commit.right.sha);
+      info('Commit', `"${commit.right.message}"`);
 
-      const diff = await repo.compareCommits(parent, commit.right.sha)();
+      const diff = await repo.compareCommits(
+        existingPr.right !== null ? existingPr.right.base.sha : parent,
+        commit.right.sha,
+      )();
       if (T.isLeft(diff)) {
         core.setFailed(`${id} - Compare commits error: ${diff.left.message}`);
         return 1;
@@ -284,10 +297,17 @@ const run = async (): Promise<number> => {
             number: GH_RUN_NUMBER,
             url: `${GH_SERVER}/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}`,
           },
-          changes: diff.right.map((d) => ({
-            from: files.right.find((f) => f.to === d.filename)?.from,
-            to: d.filename,
-          })),
+          changes: diff.right
+            .filter((d) => d.status !== 'removed')
+            .map((d) => ({
+              from: files.right.find((f) => f.to === d.filename)?.from,
+              to: d.filename,
+            })),
+          deleted: diff.right
+            .filter((d) => d.status === 'removed')
+            .map((d) => ({
+              path: d.filename,
+            })),
           index: i,
         }),
         branch,
@@ -297,7 +317,7 @@ const run = async (): Promise<number> => {
         return 1;
       }
       core.debug(`pull request: ${json(pr)}`);
-      info('Pull Request', `#${pr.right.number} - ${pr.right.html_url}`);
+      info('Pull Request', pr.right.html_url);
 
       // Add labels
       if (cfg.pull_request.labels.length > 0) {
@@ -333,6 +353,56 @@ const run = async (): Promise<number> => {
         info('Assignees', cfg.pull_request.assignees.join(', '));
       } else {
         info('Assignees', 'None');
+      }
+
+      // Merge
+      const mergeCfg = cfg.pull_request.merge;
+      if (mergeCfg.mode !== 'disabled') {
+        // Prepare message
+        let commitHeadline = null;
+        let commitBody = null;
+
+        const cc = mergeCfg.commit;
+        if (cc.format) {
+          const message = render(cc.format, {
+            prefix: cc.prefix ?? '',
+            subject: cc.subject
+              ? render(cc.subject, {
+                  repository: GH_REPOSITORY,
+                  index: i,
+                })
+              : '',
+            repository: GH_REPOSITORY,
+            index: i,
+          });
+
+          // Merge commit specifically needs headline to be separate
+          ({ headline: commitHeadline, body: commitBody } = splitCommitMessage(message));
+        }
+
+        // Run merge
+        const res = await repo.mergePullRequest({
+          number: pr.right.number,
+          mode: mergeCfg.mode,
+          strategy: mergeCfg.strategy,
+          commitHeadline,
+          commitBody,
+        })();
+        if (T.isLeft(res)) {
+          core.setFailed(`${id} - PR merge error: ${res.left.message}`);
+          return 1;
+        }
+        const mergeRes = res.right;
+        info('Pull Request Merge', mergeRes);
+
+        if (mergeRes === MergeResult.Merged && mergeCfg.delete_branch) {
+          const res = await repo.deleteBranch(branch)();
+          if (T.isLeft(res)) {
+            core.setFailed(`${id} - Delete branch error: ${res.left.message}`);
+            return 1;
+          }
+          info('Branch Deleted', `${name}@${branch}`);
+        }
       }
 
       info('Status', 'Complete');
